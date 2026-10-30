@@ -1,0 +1,168 @@
+# UC05 reusable workflow 1: feature-branch impact analysis.
+# Called from the service repo. That repo is checked out to ./repo and this agent repo to ./uc05-agent.
+name: UC05 Impact Analysis
+on:
+  workflow_call:
+    inputs:
+      agent_repository:
+        description: owner/name of the UC05 agent repository
+        type: string
+        required: false
+        default: ayushptl2307/UC05-agent   # <-- set once: your GitHub username/agent repo name
+      agent_ref:
+        description: Branch, tag or SHA of the agent repository to use
+        type: string
+        required: false
+        default: main
+      base_sha:
+        description: Optional base SHA; defaults to the merge base with the default branch
+        type: string
+        required: false
+        default: ""
+      head_sha:
+        description: Optional head SHA; defaults to HEAD
+        type: string
+        required: false
+        default: ""
+      llm_base_url:
+        description: Optional override; leave empty to use the agent repo default
+        type: string
+        required: false
+        default: ""
+      llm_model:
+        description: Optional override; leave empty to use the agent repo default
+        type: string
+        required: false
+        default: ""
+    secrets:
+      LLM_API_KEY:
+        required: false
+      UC05_AGENT_TOKEN:
+        description: Read-only token for the agent repo; only needed when that repo is private or internal
+        required: false
+permissions:
+  contents: read
+jobs:
+  impact-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UC_REPO_ROOT: ${{ github.workspace }}/repo
+      PYTHONPATH: ${{ github.workspace }}/uc05-agent
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 0
+      - name: Check out UC05 agent
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.agent_repository }}
+          ref: ${{ inputs.agent_ref }}
+          path: uc05-agent
+          token: ${{ secrets.UC05_AGENT_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: uc05-agent/requirements.txt
+      - name: Install dependencies
+        run: pip install -r uc05-agent/requirements.txt
+      - name: Determine comparison range
+        id: range
+        shell: bash
+        working-directory: repo
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_AFTER: ${{ github.event.after }}
+          INPUT_BASE: ${{ inputs.base_sha }}
+          INPUT_HEAD: ${{ inputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then REQUESTED_HEAD="$PUSH_AFTER"; else REQUESTED_HEAD="${INPUT_HEAD:-HEAD}"; fi
+          if [[ -z "$REQUESTED_HEAD" ]] || ! HEAD_SHA=$(git rev-parse --verify "${REQUESTED_HEAD}^{commit}" 2>/dev/null); then echo "Unable to resolve analysis head commit" >&2; exit 1; fi
+          if [[ -n "$INPUT_BASE" ]]; then
+            BASE_SHA=$(git rev-parse --verify "${INPUT_BASE}^{commit}")
+          else
+            BASE_REF="refs/remotes/origin/$DEFAULT_BRANCH"
+            BASE_SHA=$(git merge-base "$BASE_REF" "$HEAD_SHA")
+          fi
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          META_SHA=$(git rev-parse --verify "refs/remotes/origin/${DEFAULT_BRANCH}^{commit}" 2>/dev/null || echo "$BASE_SHA")
+          echo "metadata=$META_SHA" >> "$GITHUB_OUTPUT"
+          echo "Using config/ from $META_SHA"
+          echo "Analyzing cumulative branch diff $BASE_SHA..$HEAD_SHA"
+      - name: Run impact analysis agent
+        env:
+          UC_BASE_SHA: ${{ steps.range.outputs.base }}
+          UC_HEAD_SHA: ${{ steps.range.outputs.head }}
+          UC_METADATA_BASE_SHA: ${{ steps.range.outputs.metadata }}
+          UC_BRANCH: ${{ github.ref_name }}
+          UC_COMMIT_SHA: ${{ github.sha }}
+          UC_OUTPUT_JSON: impact-result.json
+          UC_OUTPUT_MARKDOWN: impact-report.md
+          UC_OUTPUT_PR_COMMENT: impact-analysis-summary.md
+          UC_LLM_TELEMETRY_JSON: llm-telemetry.json
+          UC_LLM_REQUEST_JSON: llm-request-sanitized.json
+          UC_LLM_RESPONSE_JSON: llm-response-sanitized.json
+          LLM_BASE_URL: ${{ inputs.llm_base_url || 'https://generativelanguage.googleapis.com/v1beta/openai/' }}   # <-- central default
+          LLM_MODEL: ${{ inputs.llm_model || 'gemini-3.1-flash-lite' }}   # <-- central default
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python -m agent.github_runner
+      - name: Generate downloadable dependency graph HTML
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f impact-result.json ]]; then
+            python -m agent.graph_renderer --input impact-result.json --output dependency-graph.html
+          else
+            echo '<!doctype html><html><body><h1>Dependency graph unavailable</h1></body></html>' > dependency-graph.html
+          fi
+      - name: Upload dependency graph HTML
+        id: graph_artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph-${{ github.run_number }}
+          path: dependency-graph.html
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload Impact Analysis Summary Markdown
+        id: summary_artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: impact-analysis-summary-${{ github.run_number }}
+          path: impact-analysis-summary.md
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Publish job summary and download links
+        if: always()
+        shell: bash
+        env:
+          GRAPH_ARTIFACT_ID: ${{ steps.graph_artifact.outputs.artifact-id }}
+          SUMMARY_ARTIFACT_ID: ${{ steps.summary_artifact.outputs.artifact-id }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "## Impact analysis" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f impact-report.md ]]; then cat impact-report.md >> "$GITHUB_STEP_SUMMARY"; else echo "The agent ended before producing impact-report.md." >> "$GITHUB_STEP_SUMMARY"; fi
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "## Download dependency graph" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$GRAPH_ARTIFACT_ID" ]]; then echo "[Download dependency graph HTML]($SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID/artifacts/$GRAPH_ARTIFACT_ID)" >> "$GITHUB_STEP_SUMMARY"; fi
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Extract the artifact and open \`dependency-graph.html\` in a browser." >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "## Impact Analysis Summary" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$SUMMARY_ARTIFACT_ID" ]]; then echo "[Download Impact Analysis Summary Markdown]($SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID/artifacts/$SUMMARY_ARTIFACT_ID)" >> "$GITHUB_STEP_SUMMARY"; fi
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Extract the artifact and open \`impact-analysis-summary.md\`." >> "$GITHUB_STEP_SUMMARY"
+      - name: Enforce Critical gate
+        if: always()
+        run: python -m agent.github_runner --gate-only impact-result.json

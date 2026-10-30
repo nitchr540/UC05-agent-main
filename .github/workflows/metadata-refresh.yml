@@ -1,0 +1,208 @@
+# UC05 reusable workflow 2: propose config/ metadata updates after a merge to main.
+# Called from the service repo. That repo is checked out to ./repo and this agent repo to ./uc05-agent.
+name: UC05 Refresh Impact Metadata
+on:
+  workflow_call:
+    inputs:
+      agent_repository:
+        description: owner/name of the UC05 agent repository
+        type: string
+        required: false
+        default: ayushptl2307/UC05-agent   # <-- set once: your GitHub username/agent repo name
+      agent_ref:
+        description: Branch, tag or SHA of the agent repository to use
+        type: string
+        required: false
+        default: main
+      base_sha:
+        description: Base commit to compare (defaults to HEAD~1)
+        type: string
+        required: false
+        default: ""
+      head_sha:
+        description: Head commit to compare (defaults to HEAD)
+        type: string
+        required: false
+        default: ""
+      llm_base_url:
+        description: Optional override; leave empty to use the agent repo default
+        type: string
+        required: false
+        default: ""
+      llm_model:
+        description: Optional override; leave empty to use the agent repo default
+        type: string
+        required: false
+        default: ""
+    secrets:
+      LLM_API_KEY:
+        required: false
+      UC05_AGENT_TOKEN:
+        description: Read-only token for the agent repo; only needed when that repo is private or internal
+        required: false
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  propose-metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UC_REPO_ROOT: ${{ github.workspace }}/repo
+      PYTHONPATH: ${{ github.workspace }}/uc05-agent
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 0
+      - name: Check out UC05 agent
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.agent_repository }}
+          ref: ${{ inputs.agent_ref }}
+          path: uc05-agent
+          token: ${{ secrets.UC05_AGENT_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: uc05-agent/requirements.txt
+      - name: Install dependencies
+        run: pip install -r uc05-agent/requirements.txt
+      - name: Determine merged range
+        id: range
+        shell: bash
+        working-directory: repo
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          INPUT_BASE: ${{ inputs.base_sha }}
+          INPUT_HEAD: ${{ inputs.head_sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            BASE_SHA="$PUSH_BEFORE"
+            HEAD_SHA="$PUSH_AFTER"
+          else
+            BASE_SHA="${INPUT_BASE:-HEAD~1}"
+            HEAD_SHA="${INPUT_HEAD:-HEAD}"
+          fi
+          if ! BASE_SHA=$(git rev-parse --verify "${BASE_SHA}^{commit}" 2>/dev/null); then
+            echo "Unable to resolve metadata base commit." >&2
+            exit 1
+          fi
+          if ! HEAD_SHA=$(git rev-parse --verify "${HEAD_SHA}^{commit}" 2>/dev/null); then
+            echo "Unable to resolve metadata head commit." >&2
+            exit 1
+          fi
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+      - name: Find source pull request
+        id: source_pr
+        uses: actions/github-script@v7
+        env:
+          SOURCE_COMMIT: ${{ steps.range.outputs.head }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const response = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: process.env.SOURCE_COMMIT,
+            });
+            const merged = response.data
+              .filter(pullRequest => pullRequest.merged_at)
+              .sort((left, right) => new Date(right.merged_at) - new Date(left.merged_at));
+            const pullRequest = merged[0];
+            core.setOutput("number", pullRequest ? String(pullRequest.number) : "");
+            core.setOutput("url", pullRequest?.html_url ?? "");
+      - name: Propose metadata changes in active config
+        id: update
+        env:
+          UC_METADATA_BASE_SHA: ${{ steps.range.outputs.base }}
+          UC_METADATA_HEAD_SHA: ${{ steps.range.outputs.head }}
+          UC_METADATA_PR_NUMBER: ${{ steps.source_pr.outputs.number }}
+          UC_METADATA_PR_URL: ${{ steps.source_pr.outputs.url }}
+          LLM_BASE_URL: ${{ inputs.llm_base_url || 'https://generativelanguage.googleapis.com/v1beta/openai/' }}   # <-- central default
+          LLM_MODEL: ${{ inputs.llm_model || 'gemini-3.1-flash-lite' }}   # <-- central default
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_TIMEOUT_SECONDS: "45"
+          UC_METADATA_OUTPUT_JSON: metadata-refresh-result.json
+          UC_METADATA_SUMMARY: metadata-refresh-summary.md
+          UC_METADATA_LLM_TELEMETRY_JSON: metadata-refresh-telemetry.json
+          UC_METADATA_LLM_REQUEST_JSON: metadata-refresh-request-sanitized.json
+          UC_METADATA_LLM_RESPONSE_JSON: metadata-refresh-response-sanitized.json
+        run: python -m agent.metadata_refresh_runner
+      - name: Publish metadata update summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f metadata-refresh-summary.md ]]; then
+            cat metadata-refresh-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Metadata refresh" >> "$GITHUB_STEP_SUMMARY"
+            echo "The updater ended before producing a metadata summary. See the step logs for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload metadata refresh evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metadata-refresh-${{ github.run_number }}
+          path: |
+            metadata-refresh-result.json
+            metadata-refresh-summary.md
+            metadata-refresh-telemetry.json
+            metadata-refresh-request-sanitized.json
+            metadata-refresh-response-sanitized.json
+          retention-days: 14
+      - name: Open or update metadata review PR
+        id: metadata_pr
+        if: steps.update.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          path: repo
+          token: ${{ github.token }}
+          base: main
+          branch: automation/impact-metadata-config
+          delete-branch: false
+          draft: true
+          add-paths: |
+            config/dependency_graph.json
+            config/service_catalog.json
+            config/test_mappings.json
+          commit-message: "chore: refresh impact metadata"
+          title: "[Impact metadata] Refresh dependency mappings"
+          body: |
+            Generated after merged source changes.
+            ${{ steps.update.outputs.summary }}
+            Review the proposed dependency, service, and test-mapping changes before merging. Git history preserves previous metadata; the active dependency graph records the update time, source commit, and merged PR. External dependencies are explicitly marked and do not count as missing local files.
+            Source commit: `${{ steps.range.outputs.head }}`
+      - name: Report metadata PR result
+        if: always()
+        shell: bash
+        env:
+          UPDATE_OUTCOME: ${{ steps.update.outcome }}
+          HAS_CHANGES: ${{ steps.update.outputs.has_changes }}
+          PR_OUTCOME: ${{ steps.metadata_pr.outcome }}
+          PR_OPERATION: ${{ steps.metadata_pr.outputs.pull-request-operation }}
+          PR_URL: ${{ steps.metadata_pr.outputs.pull-request-url }}
+        run: |
+          {
+            echo "## Metadata PR publication"
+            if [[ "$UPDATE_OUTCOME" != "success" ]]; then
+              echo "Metadata updater did not complete successfully; no PR was created. Check the updater step logs."
+            elif [[ "$HAS_CHANGES" != "true" ]]; then
+              echo "No config metadata changes were produced; PR creation was skipped."
+            elif [[ "$PR_OUTCOME" == "failure" ]]; then
+              echo "PR creation failed. Check this step's logs and confirm Settings > Actions > General allows GitHub Actions to create pull requests."
+            elif [[ -n "$PR_URL" ]]; then
+              echo "Operation: **${PR_OPERATION:-updated}**"
+              echo "Draft PR: $PR_URL"
+            else
+              echo "PR action completed with no PR URL (operation: ${PR_OPERATION:-none}). Check whether there were staged changes or an existing automation PR."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

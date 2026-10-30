@@ -1,0 +1,3 @@
+/.github/workflows/ @platform-architecture
+/agent/ @platform-architecture
+/config/ @platform-architecture
